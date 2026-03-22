@@ -493,12 +493,45 @@ function updateRoundBadge(){
 // ═══════════════════════════════════════════════
 //  PEER
 // ═══════════════════════════════════════════════
+const PEER_CFG = {
+  debug: 0,
+  config: {
+    iceServers: [
+      {urls:'stun:stun.l.google.com:19302'},
+      {urls:'stun:stun1.l.google.com:19302'},
+      {urls:'stun:stun2.l.google.com:19302'},
+      {urls:'stun:stun.cloudflare.com:3478'},
+    ]
+  }
+};
+
 function initPeer(id){
   return new Promise((res,rej)=>{
-    const p=new Peer(id,{debug:0});
-    p.on('open',()=>res(p));
-    p.on('error',e=>rej(e));
-    setTimeout(()=>rej(new Error('timeout')),10000);
+    const p=new Peer(id, PEER_CFG);
+    p.on('open', rid=>{ console.log('Peer open:', rid); res(p); });
+    p.on('error', e=>{
+      console.error('Peer error:', e.type, e);
+      if(e.type==='unavailable-id'){
+        // ID zajęte — spróbuj z losowym suffixem
+        const p2=new Peer(id+'x'+uid().slice(0,4), PEER_CFG);
+        p2.on('open', rid2=>{ console.log('Peer open (retry):', rid2); res(p2); });
+        p2.on('error', e2=>rej(e2));
+        setTimeout(()=>rej(new Error('timeout retry')),10000);
+      } else rej(e);
+    });
+    setTimeout(()=>rej(new Error('peer init timeout')),14000);
+  });
+}
+
+function setupGuestConn(conn){
+  conn.on('open',()=>{
+    guestConns[conn.peer]=conn;
+    conn.on('data', d=>{ try{ handleGuestMsg(conn.peer, typeof d==='string'?JSON.parse(d):d); }catch(e){} });
+    conn.on('close',()=>{
+      const gId=Object.keys(state.players).find(k=>state.players[k]?.peerId===conn.peer);
+      if(gId){ delete state.players[gId]; delete guestConns[conn.peer]; broadcast(); renderLobby(); }
+    });
+    conn.on('error', e=>console.error('guest conn error', e));
   });
 }
 
@@ -510,21 +543,16 @@ async function createRoom(){
   ov(true,'tworzę pokój…');
   try{
     roomCode=randCode();
-    peer=await initPeer('imp_'+roomCode);
+    const hostPeerId='imph_'+roomCode;
+    peer=await initPeer(hostPeerId);
     isHost=true;
     state={players:{[myId]:{name:myName}},status:'lobby',assignments:{},votes:{},seenCard:{},result:null,scores:{[myId]:0},round:1,totalRounds:hostRounds,impostorGuess:null};
-    peer.on('connection',conn=>{
-      conn.on('open',()=>{
-        guestConns[conn.peer]=conn;
-        conn.on('data',d=>handleGuestMsg(conn.peer,d));
-        conn.on('close',()=>{
-          const gId=Object.keys(state.players).find(k=>state.players[k]?.peerId===conn.peer);
-          if(gId){delete state.players[gId];delete guestConns[conn.peer];broadcast();}
-        });
-      });
-    });
+    // Store actual peer ID (might differ if retried)
+    state._hostPeerId = peer.id;
+    peer.on('connection', conn=>{ setupGuestConn(conn); });
+    peer.on('error', e=>{ toast('Błąd sieci: '+e.type); console.error(e); });
     ov(false); enterLobby();
-  }catch(e){ov(false);toast('❌ Błąd połączenia');console.error(e);}
+  }catch(e){ov(false);toast('❌ Błąd połączenia — odśwież i spróbuj ponownie');console.error(e);}
 }
 
 // ═══════════════════════════════════════════════
@@ -536,22 +564,44 @@ async function joinRoom(){
   if(code.length<2) return toast('Wpisz kod!');
   ov(true,'łączę…');
   try{
-    const myPeerId='imp_guest_'+uid();
+    const myPeerId='impg_'+uid();
     peer=await initPeer(myPeerId);
     isHost=false; roomCode=code;
-    hostConn=peer.connect('imp_'+code,{reliable:true});
-    await new Promise((res,rej)=>{hostConn.on('open',res);hostConn.on('error',rej);setTimeout(()=>rej(new Error('timeout')),8000);});
-    hostConn.on('data',d=>handleHostMsg(d));
-    hostConn.on('close',()=>{toast('Host rozłączył się');leaveRoom();});
+
+    // Try connecting to host peer ID
+    const hostPeerId='imph_'+code;
+    ov(true,'łączę z pokojem…');
+
+    hostConn=peer.connect(hostPeerId,{reliable:true, serialization:'json'});
+
+    await new Promise((res,rej)=>{
+      hostConn.on('open', ()=>{ console.log('Connected to host!'); res(); });
+      hostConn.on('error', e=>{ console.error('hostConn error',e); rej(e); });
+      setTimeout(()=>rej(new Error('conn timeout')),10000);
+    });
+
+    hostConn.on('data', d=>{ try{ handleHostMsg(typeof d==='string'?JSON.parse(d):d); }catch(e){} });
+    hostConn.on('close', ()=>{ toast('Host rozłączył się'); leaveRoom(); });
+    hostConn.on('error', e=>{ toast('Błąd połączenia z hostem'); console.error(e); });
+
     send(hostConn,{type:'JOIN',id:myId,name:myName,peerId:myPeerId});
     ov(false); enterLobby();
-  }catch(e){ov(false);toast('❌ Nie można dołączyć — sprawdź kod!');peer?.destroy();peer=null;console.error(e);}
+  }catch(e){
+    ov(false);
+    console.error('Join error:', e);
+    if(e.message&&e.message.includes('timeout')){
+      toast('❌ Nie można połączyć — upewnij się że host jest online i kod jest poprawny');
+    } else {
+      toast('❌ Błąd: '+( e.type||e.message||'nieznany'));
+    }
+    peer?.destroy(); peer=null;
+  }
 }
 
 // ═══════════════════════════════════════════════
 //  MESSAGING
 // ═══════════════════════════════════════════════
-function send(conn,msg){try{conn.send(msg);}catch(e){}}
+function send(conn,msg){try{if(conn&&conn.open)conn.send(msg);}catch(e){console.error("send err",e);}}
 function broadcast(){Object.values(guestConns).forEach(c=>send(c,{type:'STATE',state}));}
 
 function handleGuestMsg(gPeer,d){
